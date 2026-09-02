@@ -155,6 +155,14 @@ teresoreria-178-104-99-197.sslip.io  →  host.docker.internal:8091
 El `rsync` usa `--delete` pero excluye `.env` y los `backup_*.sql`, así que los
 secretos y las copias del servidor sobreviven a cada despliegue.
 
+Mientras el workflow no esté subido (necesita el permiso `workflow` en el token
+de `gh`), el despliegue se hace a mano por SSH, que es como se hizo el primero:
+
+```bash
+ssh root@178.104.99.197
+cd /opt/teresoreria && git pull && docker compose up -d --build
+```
+
 Primera vez en el servidor:
 
 ```bash
