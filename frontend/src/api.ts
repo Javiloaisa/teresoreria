@@ -85,6 +85,17 @@ export const api = {
     enviar<Regla>("/reglas", "POST", datos),
   borrarRegla: (id: number) => enviar<{ ok: true }>(`/reglas/${id}`, "DELETE"),
 
+  // Notificaciones push
+  clavePush: () => pedir<{ clave: string; configurado: boolean }>("/push/clave"),
+  estadoPush: () =>
+    pedir<{ configurado: boolean; dispositivos: number; proximo_repaso: string | null }>(
+      "/push/estado"
+    ),
+  suscribirPush: (suscripcion: unknown) =>
+    enviar<{ ok: true }>("/push/suscribir", "POST", suscripcion),
+  bajaPush: (endpoint: string) => enviar<{ ok: true }>("/push/baja", "POST", { endpoint }),
+  probarPush: () => enviar<{ entregados: number }>("/push/prueba", "POST"),
+
   // Configuración
   config: () => pedir<Config>("/config"),
   guardarConfig: (datos: Partial<Config>) =>

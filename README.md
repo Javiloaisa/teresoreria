@@ -8,9 +8,9 @@ después.
 - **Backend:** FastAPI + PostgreSQL
 - **Despliegue:** VPS de Hetzner, stack Docker propio detrás del Caddy compartido
 
-Estado: **F1 y F2 hechas** (botes, gastos, recurrentes con prorrateo y reglas de
-clasificación). Pendientes F3 (avisos push y cron) y F4 (historial y comparativa
-entre meses).
+Estado: **F1, F2 y F3 hechas** (botes, gastos, recurrentes con prorrateo, reglas
+de clasificación, y avisos push con su repaso diario). Pendiente F4 (historial y
+comparativa entre meses).
 
 ---
 
@@ -62,8 +62,30 @@ proyeccion       = reservas + (variable_gastado / D) × N
 - **Rojo** — la proyección se pasa, o ya te has pasado de hecho
 
 Los primeros 5 días del mes el estado se pinta pero no se notifica: con tres
-días de datos la proyección es ruido. El campo `avisable` ya viene calculado
-para cuando exista el envío (F3).
+días de datos la proyección es ruido.
+
+## Avisos
+
+Un repaso diario a la hora que diga `config.hora_aviso` (por defecto las 08:30),
+con APScheduler dentro del propio proceso de la API. Por eso uvicorn corre con
+**un solo worker**: con varios, cada aviso saldría repetido.
+
+El antispam es la parte delicada, porque un aviso que se repite deja de leerse:
+**uno por bote, nivel y mes**, garantizado por el índice único de
+`avisos_enviados`. Un bote que vuelve a verde pierde sus filas, así que si se
+tuerce otra vez en el mismo mes vuelve a avisar. De ámbar a rojo sí se avisa
+(empeorar es noticia); de rojo a ámbar no.
+
+Un aviso solo se da por enviado si de verdad llegó a algún dispositivo. Si
+todavía no hay ninguno suscrito, mañana se reintenta en vez de perderse.
+
+```
+Deseos: te vas a pasar
+Vas camino de 340 € y el tope son 300 €. Quedan 11 días.
+```
+
+Las suscripciones que el navegador tira (desinstalar la app, borrar los datos
+del sitio) se borran solas al recibir un 404 o 410 del servicio de push.
 
 ## Clasificación automática
 
@@ -93,7 +115,10 @@ números.
 | [api/index.py](api/index.py) | Rutas de FastAPI, todas bajo `/api` |
 | [api/auth.py](api/auth.py) | Contraseña con argon2 y cookie de sesión firmada (60 días) |
 | [api/db.py](api/db.py) | Pool de conexiones a Postgres |
+| [api/avisos.py](api/avisos.py) | ⭐ Qué avisar, con qué texto y el antispam. También pura |
+| [api/push.py](api/push.py) | Envío por Web Push (VAPID) con pywebpush |
 | [api/manage.py](api/manage.py) | `set-password`: crea o cambia la contraseña |
+| [api/gen_vapid.py](api/gen_vapid.py) | Genera el par de claves VAPID (una sola vez) |
 | [frontend/src/](frontend/src/) | Las tres pantallas: Resumen, Añadir gasto y Ajustes |
 | [scripts/gen_iconos.py](scripts/gen_iconos.py) | Genera los PNG de la PWA (solo si se cambia el diseño) |
 | [tests/](tests/) | pytest. Los de `calc` y `clasificar` no necesitan base de datos |
@@ -170,6 +195,10 @@ cd /opt/teresoreria
 cp .env.example .env && nano .env      # DB_PASSWORD, SECRET_KEY, COOKIE_SECURE=1
 docker compose up -d --build
 docker compose exec api python manage.py set-password
+
+# Claves para los avisos push (una sola vez); pega las dos lineas en el .env
+docker compose exec api python gen_vapid.py
+docker compose up -d api
 ```
 
 ## En el móvil
@@ -178,4 +207,7 @@ Abrir `https://teresoreria-178-104-99-197.sslip.io` y **Compartir → Añadir a
 pantalla de inicio**. En iPhone ese paso no es opcional para los avisos de F3:
 Apple solo entrega notificaciones web a las apps instaladas (iOS 16.4 o
 superior), y sin instalar la suscripción falla sin explicar por qué. La app lo
-avisa en Ajustes.
+detecta y lo avisa en Ajustes en vez de dejarte con un botón que no funciona.
+
+Una vez instalada: Ajustes → Avisos en el móvil → **Activar los avisos**, y
+comprueba que llegan con **Enviarme un aviso de prueba** antes de fiarte.

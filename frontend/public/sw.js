@@ -4,7 +4,7 @@
 // cachear el armazón para que abra al instante. El manejador de `push` llega
 // en F3; el hueco está preparado abajo.
 
-const CACHE = "teresoreria-v1";
+const CACHE = "teresoreria-v2";
 const ARMAZON = ["/", "/index.html", "/manifest.webmanifest", "/icon-192.png"];
 
 self.addEventListener("install", (evento) => {
@@ -42,17 +42,45 @@ self.addEventListener("fetch", (evento) => {
   );
 });
 
-// ── F3: notificaciones push ─────────────────────────────────────────────────
-// Cuando llegue la fase 3, esto se rellena con el aviso y su clic:
-//
-// self.addEventListener("push", (evento) => {
-//   const datos = evento.data.json();
-//   evento.waitUntil(self.registration.showNotification(datos.titulo, {
-//     body: datos.cuerpo, icon: "/icon-192.png", badge: "/icon-192.png",
-//   }));
-// });
-//
-// self.addEventListener("notificationclick", (evento) => {
-//   evento.notification.close();
-//   evento.waitUntil(self.clients.openWindow("/"));
-// });
+// ── Notificaciones push ─────────────────────────────────────────────────────
+// El aviso llega aunque la app esté cerrada: lo recibe este service worker,
+// no la página. Por eso el texto tiene que venir hecho desde el servidor.
+
+self.addEventListener("push", (evento) => {
+  let datos = {};
+  try {
+    datos = evento.data ? evento.data.json() : {};
+  } catch (e) {
+    datos = {};
+  }
+
+  evento.waitUntil(
+    self.registration.showNotification(datos.titulo || "Teresorería", {
+      body: datos.cuerpo || "",
+      icon: "/icon-192.png",
+      badge: "/icon-192.png",
+      vibrate: [80, 40, 80],
+      // Un aviso por bote: si llega otro del mismo, sustituye al anterior en
+      // vez de apilarse. Nadie quiere seis notificaciones de Deseos.
+      tag: datos.titulo || "teresoreria",
+      data: { url: datos.url || "/" },
+    })
+  );
+});
+
+self.addEventListener("notificationclick", (evento) => {
+  evento.notification.close();
+  const url = (evento.notification.data && evento.notification.data.url) || "/";
+
+  // Si la app ya está abierta se le da el foco en vez de abrir otra ventana.
+  evento.waitUntil(
+    self.clients
+      .matchAll({ type: "window", includeUncontrolled: true })
+      .then((ventanas) => {
+        for (const ventana of ventanas) {
+          if ("focus" in ventana) return ventana.focus();
+        }
+        if (self.clients.openWindow) return self.clients.openWindow(url);
+      })
+  );
+});

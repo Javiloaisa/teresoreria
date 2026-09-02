@@ -226,3 +226,89 @@ def test_un_recurrente_no_mensual_necesita_mes_de_cargo(cliente):
         "cat": "necesidad",
     })
     assert r.status_code == 422
+
+
+# -- Notificaciones push -----------------------------------------------------
+# En desarrollo no hay claves VAPID, asi que no se envia nada de verdad: lo que
+# se comprueba aqui es el guardado de suscripciones y el repaso de avisos.
+
+SUSCRIPCION = {
+    "endpoint": "https://push.example.com/abc123",
+    "keys": {"p256dh": "clave-publica-de-prueba", "auth": "secreto-de-prueba"},
+}
+
+
+def test_el_push_tambien_exige_sesion():
+    anonimo = TestClient(app)
+    assert anonimo.get("/api/push/estado").status_code == 401
+    assert anonimo.post("/api/push/suscribir", json=SUSCRIPCION).status_code == 401
+
+
+def test_alta_y_baja_de_un_dispositivo(cliente):
+    with get_conn() as conn:
+        conn.execute("TRUNCATE push_subscriptions")
+
+    assert cliente.post("/api/push/suscribir", json=SUSCRIPCION).status_code == 200
+    assert cliente.get("/api/push/estado").json()["dispositivos"] == 1
+
+    # Volver a suscribirse desde el mismo movil no duplica la fila.
+    cliente.post("/api/push/suscribir", json=SUSCRIPCION)
+    assert cliente.get("/api/push/estado").json()["dispositivos"] == 1
+
+    cliente.post("/api/push/baja", json={"endpoint": SUSCRIPCION["endpoint"]})
+    assert cliente.get("/api/push/estado").json()["dispositivos"] == 0
+
+
+def test_sin_claves_vapid_la_prueba_lo_dice(cliente):
+    r = cliente.post("/api/push/prueba")
+    assert r.status_code == 409
+    assert "VAPID" in r.json()["detail"] or "dispositivo" in r.json()["detail"]
+
+
+def test_el_repaso_no_avisa_de_un_mes_tranquilo(cliente):
+    cliente.post("/api/ingresos", json={"concepto": "Nomina", "importe": "2000.00"})
+    salida = cliente.post("/api/avisos/revisar").json()
+    assert salida["avisos"] == []
+    assert salida["entregados"] == 0
+
+
+def test_el_repaso_detecta_un_bote_pasado(cliente):
+    """Con la nomina declarada y un gasto que se sale, hay algo que avisar.
+
+    Solo cuenta a partir del dia 6: antes, la proyeccion es ruido y el motor
+    calla a proposito (se comprueba en tests/test_avisos.py).
+    """
+    from datetime import date
+
+    cliente.post("/api/ingresos", json={"concepto": "Nomina", "importe": "2000.00"})
+    # Deseos son 600 EUR; 900 se pasa por cualquier via.
+    cliente.post("/api/gastos",
+                 json={"concepto": "Capricho", "importe": "900.00", "cat": "deseo"})
+
+    salida = cliente.post("/api/avisos/revisar").json()
+    if date.today().day > 5:
+        assert [a["cat"] for a in salida["avisos"]] == ["deseo"]
+        assert salida["avisos"][0]["nivel"] == "rojo"
+    else:
+        assert salida["avisos"] == []
+
+
+def test_sin_dispositivos_el_aviso_no_se_da_por_enviado(cliente):
+    """Si nadie esta suscrito, manana se vuelve a intentar en vez de perderlo."""
+    from datetime import date
+
+    with get_conn() as conn:
+        conn.execute("TRUNCATE push_subscriptions, avisos_enviados")
+
+    cliente.post("/api/ingresos", json={"concepto": "Nomina", "importe": "2000.00"})
+    cliente.post("/api/gastos",
+                 json={"concepto": "Capricho", "importe": "900.00", "cat": "deseo"})
+    cliente.post("/api/avisos/revisar")
+
+    with get_conn() as conn:
+        filas = conn.execute("SELECT count(*) AS n FROM avisos_enviados").fetchone()
+    assert filas["n"] == 0
+
+    # Y al repetir el repaso sigue habiendo algo que avisar (no se ha "gastado").
+    if date.today().day > 5:
+        assert cliente.post("/api/avisos/revisar").json()["avisos"] != []

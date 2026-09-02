@@ -5,14 +5,21 @@ El cálculo de verdad vive en `calc.py`; aquí solo se lee de la base, se le pas
 y se devuelve. Las rutas exigen sesión salvo `/api/health` y el login.
 """
 
+import logging
+from contextlib import asynccontextmanager
 from datetime import date
 from decimal import Decimal
 from typing import Literal, Optional
+from zoneinfo import ZoneInfo
 
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 
+import avisos
 import calc
+import push
 from auth import (
     clear_cookie,
     hay_sesion,
@@ -23,7 +30,32 @@ from auth import (
 from clasificar import clasificar, normalizar
 from db import get_conn, query, query_one
 
-app = FastAPI(title="Teresorería", docs_url=None, redoc_url=None)
+log = logging.getLogger("teresoreria")
+
+ZONA = ZoneInfo("Europe/Madrid")
+planificador = BackgroundScheduler(timezone=ZONA)
+
+
+@asynccontextmanager
+async def ciclo_de_vida(_app: FastAPI):
+    """Arranca el repaso diario de avisos junto con la API.
+
+    Va dentro del propio proceso (por eso uvicorn corre con un solo worker:
+    con varios, el aviso saldría repetido). Si algo falla al programarlo, la
+    API arranca igual: preferimos quedarnos sin avisos que sin app.
+    """
+    try:
+        reprogramar_avisos()
+        planificador.start()
+    except Exception:
+        log.exception("No se ha podido arrancar el planificador de avisos")
+    yield
+    if planificador.running:
+        planificador.shutdown(wait=False)
+
+
+app = FastAPI(title="Teresorería", docs_url=None, redoc_url=None,
+              lifespan=ciclo_de_vida)
 
 Categoria = Literal["necesidad", "deseo", "ahorro"]
 Periodicidad = Literal["mensual", "bimestral", "trimestral", "semestral", "anual"]
@@ -552,4 +584,178 @@ def editar_config(datos: ConfigPatch):
             f"UPDATE config SET {sets} WHERE id = 1 RETURNING *",
             tuple(campos.values()),
         ).fetchone()
+
+    # La hora del aviso solo se lee al programar el trabajo, así que si cambia
+    # hay que reprogramarlo o seguiría saltando a la hora vieja hasta el
+    # siguiente reinicio.
+    if "hora_aviso" in campos and planificador.running:
+        try:
+            reprogramar_avisos()
+        except Exception:
+            log.exception("No se ha podido reprogramar el aviso diario")
+
     return {"config": cfg, "resumen": construir_resumen()}
+
+
+# ── Notificaciones push ──────────────────────────────────────────────────────
+
+class ClavesPush(BaseModel):
+    p256dh: str
+    auth: str
+
+
+class SuscripcionIn(BaseModel):
+    endpoint: str
+    keys: ClavesPush
+
+
+class BajaIn(BaseModel):
+    endpoint: str
+
+
+def _suscripciones() -> list[dict]:
+    """Las suscripciones en el formato que espera pywebpush."""
+    return [
+        {"endpoint": f["endpoint"],
+         "keys": {"p256dh": f["p256dh"], "auth": f["auth"]}}
+        for f in query("SELECT endpoint, p256dh, auth FROM push_subscriptions")
+    ]
+
+
+def enviar_a_todos(titulo: str, cuerpo: str) -> int:
+    """Manda el aviso a todos los dispositivos. Devuelve cuántos lo recibieron.
+
+    Las suscripciones que el navegador ya ha tirado (desinstalar la app, borrar
+    los datos del sitio) se borran solas: si no, la tabla se llena de endpoints
+    muertos y cada aviso tarda diez segundos en dar error por cada uno.
+    """
+    if not push.configurado():
+        return 0
+
+    entregados, caducadas = 0, []
+    for suscripcion in _suscripciones():
+        enviado, codigo = push.enviar(suscripcion, titulo, cuerpo)
+        if enviado:
+            entregados += 1
+        elif codigo in push.CADUCADA:
+            caducadas.append(suscripcion["endpoint"])
+        else:
+            log.warning("Push fallido (%s) en %s", codigo, suscripcion["endpoint"][:40])
+
+    if caducadas:
+        with get_conn() as conn:
+            conn.execute(
+                "DELETE FROM push_subscriptions WHERE endpoint = ANY(%s)", (caducadas,))
+    return entregados
+
+
+def revisar_avisos() -> dict:
+    """El repaso diario: mira los tres botes y manda lo que toque."""
+    mes = primer_dia(hoy())
+    resumen = construir_resumen()
+
+    ya_enviados = {
+        (f["cat"], f["nivel"])
+        for f in query("SELECT cat, nivel FROM avisos_enviados WHERE mes = %s", (mes,))
+    }
+    plan = avisos.decidir(resumen, ya_enviados)
+
+    with get_conn() as conn:
+        # Los botes que han vuelto a verde pierden sus filas: si se tuercen
+        # otra vez este mes, el aviso tiene que volver a saltar.
+        for cat in plan["rearmar"]:
+            conn.execute(
+                "DELETE FROM avisos_enviados WHERE mes = %s AND cat = %s", (mes, cat))
+
+    entregados = 0
+    for aviso in plan["enviar"]:
+        n = enviar_a_todos(aviso["titulo"], aviso["cuerpo"])
+        entregados += n
+        # Solo se da por avisado si de verdad llegó a algún sitio. Si todavía
+        # no hay ningún móvil suscrito, mañana se vuelve a intentar en vez de
+        # perder el aviso de este mes.
+        if n:
+            with get_conn() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO avisos_enviados (mes, cat, nivel) VALUES (%s, %s, %s)
+                    ON CONFLICT (mes, cat, nivel) DO NOTHING
+                    """,
+                    (mes, aviso["cat"], aviso["nivel"]),
+                )
+
+    log.info("Repaso de avisos: %d por mandar, %d entregados, %d rearmados",
+             len(plan["enviar"]), entregados, len(plan["rearmar"]))
+    return {"revisados": len(resumen["botes"]), "avisos": plan["enviar"],
+            "entregados": entregados, "rearmados": plan["rearmar"]}
+
+
+def reprogramar_avisos() -> None:
+    """(Re)programa el repaso diario a la hora que diga la configuración."""
+    hora = leer_config()["hora_aviso"]
+    planificador.add_job(
+        revisar_avisos,
+        CronTrigger(hour=hora.hour, minute=hora.minute, timezone=ZONA),
+        id="avisos",
+        replace_existing=True,
+        # Si el contenedor estaba reiniciándose justo a esa hora, todavía vale.
+        misfire_grace_time=3600,
+    )
+
+
+@app.get("/api/push/clave", dependencies=protegido)
+def clave_push():
+    return {"clave": push.clave_publica(), "configurado": push.configurado()}
+
+
+@app.get("/api/push/estado", dependencies=protegido)
+def estado_push():
+    total = query_one("SELECT count(*) AS n FROM push_subscriptions")
+    proximo = planificador.get_job("avisos") if planificador.running else None
+    return {
+        "configurado": push.configurado(),
+        "dispositivos": total["n"] if total else 0,
+        "proximo_repaso": proximo.next_run_time.isoformat() if proximo else None,
+    }
+
+
+@app.post("/api/push/suscribir", dependencies=protegido)
+def suscribir(datos: SuscripcionIn, request: Request):
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO push_subscriptions (endpoint, p256dh, auth, user_agent)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (endpoint) DO UPDATE
+              SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth
+            """,
+            (datos.endpoint, datos.keys.p256dh, datos.keys.auth,
+             request.headers.get("user-agent")),
+        )
+    return {"ok": True}
+
+
+@app.post("/api/push/baja", dependencies=protegido)
+def dar_de_baja(datos: BajaIn):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM push_subscriptions WHERE endpoint = %s",
+                     (datos.endpoint,))
+    return {"ok": True}
+
+
+@app.post("/api/push/prueba", dependencies=protegido)
+def probar_push():
+    """Un aviso de prueba, para comprobar que llega antes de fiarse."""
+    if not push.configurado():
+        raise HTTPException(409, "Faltan las claves VAPID en el servidor.")
+    entregados = enviar_a_todos(
+        "Teresorería", "Los avisos funcionan. Te avisaré antes de que te pases.")
+    if not entregados:
+        raise HTTPException(409, "No hay ningún dispositivo suscrito (o ya caducó).")
+    return {"entregados": entregados}
+
+
+@app.post("/api/avisos/revisar", dependencies=protegido)
+def revisar_ahora():
+    """Lanza el repaso a mano, sin esperar a la hora del aviso."""
+    return revisar_avisos()

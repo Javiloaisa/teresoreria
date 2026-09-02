@@ -1,7 +1,15 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { api, ErrorApi } from "../api";
 import { euros, eurosCortos, fechaCorta, aNumero, hoyISO } from "../format";
+import {
+  activarAvisos,
+  avisosActivados,
+  desactivarAvisos,
+  esIOS,
+  estaInstalada,
+  soportaPush,
+} from "../push";
 import type {
   Categoria,
   Config,
@@ -117,9 +125,7 @@ export default function Ajustes({
         <ListaReglas reglas={reglas} onReglas={onReglas} />
       </Seccion>
 
-      <Seccion titulo="Avisos en el móvil">
-        <AvisosPendientes />
-      </Seccion>
+      <Avisos config={config} onGuardar={guardarConfig} />
 
       <button
         onClick={async () => {
@@ -584,33 +590,149 @@ function ListaReglas({
   );
 }
 
-// ── Avisos (F3) ─────────────────────────────────────────────────────────────
+// ── Avisos ──────────────────────────────────────────────────────────────────
 
-function AvisosPendientes() {
-  const enIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-  const instalada = window.matchMedia("(display-mode: standalone)").matches;
+function Avisos({
+  config,
+  onGuardar,
+}: {
+  config: Config;
+  onGuardar: (c: Partial<Config>) => void;
+}) {
+  const [activados, setActivados] = useState<boolean | null>(null);
+  const [estado, setEstado] = useState<{
+    configurado: boolean;
+    dispositivos: number;
+    proximo_repaso: string | null;
+  } | null>(null);
+  const [aviso, setAviso] = useState("");
+  const [ocupado, setOcupado] = useState(false);
+
+  const enIOS = esIOS();
+  const instalada = estaInstalada();
+  // En iPhone, Safari ni siquiera ofrece push si la app no está en la pantalla
+  // de inicio: sin este aviso, activar los avisos falla sin explicar por qué.
+  const faltaInstalar = enIOS && !instalada;
+
+  const refrescar = useCallback(async () => {
+    setActivados(await avisosActivados().catch(() => false));
+    setEstado(await api.estadoPush().catch(() => null));
+  }, []);
+
+  useEffect(() => {
+    refrescar();
+  }, [refrescar]);
+
+  async function alternar() {
+    setOcupado(true);
+    setAviso("");
+    try {
+      if (activados) {
+        await desactivarAvisos();
+      } else {
+        const r = await activarAvisos();
+        if (r === "denegado")
+          setAviso("Has bloqueado las notificaciones. Actívalas en los ajustes del navegador.");
+        if (r === "no-soportado")
+          setAviso("Este navegador no admite avisos, o faltan las claves en el servidor.");
+      }
+      await refrescar();
+    } catch {
+      setAviso("No se ha podido cambiar la suscripción.");
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  async function probar() {
+    setOcupado(true);
+    setAviso("");
+    try {
+      await api.probarPush();
+      setAviso("Enviado. Debería llegarte en un momento.");
+    } catch (err) {
+      setAviso(err instanceof ErrorApi ? err.message : "No se ha podido enviar.");
+    } finally {
+      setOcupado(false);
+    }
+  }
 
   return (
-    <div className="space-y-3 text-sm text-stone-600">
-      <p>
-        Las notificaciones que avisan <b>antes</b> de pasarte llegan en la
-        siguiente fase. De momento el estado se ve en las barras del resumen.
+    <Seccion titulo="Avisos en el móvil">
+      <p className="text-xs text-stone-500">
+        Un repaso al día a los tres botes. Si alguno va camino de pasarse, te
+        llega un aviso. Uno por bote y mes: si se repitiera, dejarías de leerlo.
+        Los primeros 5 días del mes no se avisa, porque con tan pocos datos la
+        proyección es ruido.
       </p>
 
-      {enIOS && !instalada && (
-        // Este aviso no es decorativo: en iPhone, sin instalar la app, la
-        // suscripción a los avisos falla sin decir por qué.
-        <p className="rounded-xl bg-amber-50 p-3 text-amber-900">
-          <b>En iPhone hay que instalar la app</b> para que los avisos puedan
-          funcionar: pulsa <b>Compartir</b> y luego{" "}
-          <b>Añadir a pantalla de inicio</b>. Hace falta iOS 16.4 o superior.
+      {faltaInstalar ? (
+        <p className="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">
+          <b>En iPhone hay que instalar la app antes.</b> Pulsa{" "}
+          <b>Compartir</b> y luego <b>Añadir a pantalla de inicio</b>, ábrela
+          desde ahí y vuelve a esta pantalla. Hace falta iOS 16.4 o superior.
+        </p>
+      ) : !soportaPush() ? (
+        <p className="rounded-xl bg-stone-100 p-3 text-sm">
+          Este navegador no admite notificaciones web.
+        </p>
+      ) : (
+        <>
+          <button
+            onClick={alternar}
+            disabled={ocupado || activados === null}
+            className={`w-full rounded-xl py-3 font-semibold disabled:opacity-40 ${
+              activados
+                ? "border border-stone-200 bg-white text-stone-600"
+                : "bg-tinta text-crema"
+            }`}
+          >
+            {activados ? "Desactivar los avisos en este móvil" : "Activar los avisos"}
+          </button>
+
+          {activados && (
+            <button
+              onClick={probar}
+              disabled={ocupado}
+              className="w-full rounded-xl border border-stone-200 bg-white py-2.5 text-sm text-stone-600 disabled:opacity-40"
+            >
+              Enviarme un aviso de prueba
+            </button>
+          )}
+        </>
+      )}
+
+      {aviso && <p className="text-sm text-stone-600">{aviso}</p>}
+
+      <label className="block">
+        <span className="text-xs text-stone-500">Hora del aviso diario</span>
+        <input
+          type="time"
+          defaultValue={String(config.hora_aviso).slice(0, 5)}
+          onBlur={(e) => {
+            const v = e.target.value;
+            if (v && v !== String(config.hora_aviso).slice(0, 5))
+              onGuardar({ hora_aviso: v });
+          }}
+          className={`cifras ${entrada}`}
+        />
+      </label>
+
+      {estado && (
+        <p className="text-xs text-stone-400">
+          {estado.configurado
+            ? `${estado.dispositivos} ${
+                estado.dispositivos === 1 ? "dispositivo suscrito" : "dispositivos suscritos"
+              }`
+            : "El servidor no tiene claves VAPID: los avisos están apagados."}
+          {estado.proximo_repaso &&
+            ` · próximo repaso ${new Date(estado.proximo_repaso).toLocaleString("es-ES", {
+              weekday: "short",
+              hour: "2-digit",
+              minute: "2-digit",
+            })}`}
         </p>
       )}
-      {instalada && (
-        <p className="rounded-xl bg-stone-100 p-3">
-          App instalada en la pantalla de inicio ✓
-        </p>
-      )}
-    </div>
+    </Seccion>
   );
 }
