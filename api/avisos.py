@@ -70,6 +70,13 @@ def decidir(resumen: dict, ya_enviados: Iterable[tuple[str, str]]) -> dict:
     enviados = set(ya_enviados)
     enviar, rearmar = [], []
 
+    # Sin base no hay nada que juzgar. Con el presupuesto a cero, cualquier
+    # gasto deja el bote en rojo y saldrían tres avisos de "te has pasado" que
+    # solo significan que aún no has declarado el ingreso del mes. La pantalla
+    # ya lo dice; el móvil no tiene por qué dar la lata con ello.
+    if resumen.get("base", 0) <= 0:
+        return {"enviar": [], "rearmar": []}
+
     for bote in resumen["botes"]:
         cat, estado = bote["cat"], bote["estado"]
 

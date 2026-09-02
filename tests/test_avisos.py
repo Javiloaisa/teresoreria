@@ -22,8 +22,8 @@ def bote(cat="deseo", estado="rojo", presupuesto=300, gastado=200,
     }
 
 
-def resumen(*botes, dias_restantes=11):
-    return {"botes": list(botes), "dias_restantes": dias_restantes}
+def resumen(*botes, dias_restantes=11, base=2000):
+    return {"botes": list(botes), "dias_restantes": dias_restantes, "base": base}
 
 
 # -- El texto del aviso ------------------------------------------------------
@@ -129,3 +129,11 @@ def test_un_bote_que_se_arregla_no_afecta_a_los_demas():
     salida = decidir(r, [("deseo", "rojo"), ("ahorro", "rojo")])
     assert salida["rearmar"] == ["deseo"]
     assert salida["enviar"] == []      # el de ahorro ya estaba avisado
+
+
+def test_sin_ingresos_declarados_no_se_avisa_de_nada():
+    """Con la base a cero el presupuesto es cero y cualquier gasto deja el bote
+    en rojo. Eso no significa que te hayas pasado: significa que todavia no has
+    declarado el ingreso del mes, y la pantalla ya lo dice."""
+    r = resumen(bote(estado="rojo"), bote(cat="ahorro", estado="rojo"), base=0)
+    assert decidir(r, []) == {"enviar": [], "rearmar": []}
