@@ -13,3 +13,6 @@ dist/
 
 # Copias de seguridad de la base de datos
 backup_*.sql
+
+# Cache incremental de TypeScript: se regenera en cada build.
+*.tsbuildinfo
