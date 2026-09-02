@@ -1,0 +1,59 @@
+# Teresorería — stack completo y aislado en el VPS:
+#   db    -> Postgres propio (datos en un volumen, no en el Postgres del host)
+#   api   -> FastAPI (uvicorn)
+#   caddy -> compila el frontend, lo sirve y proxya /api
+#
+# El Caddy de este stack NO toma los puertos 80/443 del host: los tiene el Caddy
+# frontal de /opt/partes-de-obra, que enruta por hostname
+#   teresoreria-178-104-99-197.sslip.io -> host.docker.internal:8091
+#
+# Copia .env.example a .env, rellénalo y: docker compose up -d --build
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: teresoreria
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?falta DB_PASSWORD en .env}
+      POSTGRES_DB: teresoreria
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+      # Se ejecuta SOLO en el primer arranque (BD vacía): crea tablas y siembra.
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U teresoreria -d teresoreria"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  api:
+    build: ./api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://teresoreria:${DB_PASSWORD}@db:5432/teresoreria
+      SECRET_KEY: ${SECRET_KEY:?falta SECRET_KEY en .env}
+      COOKIE_SECURE: ${COOKIE_SECURE:-1}
+      # El corte de mes y el "hoy" del formulario dependen de la zona horaria.
+      TZ: ${TZ:-Europe/Madrid}
+      # Vacías hasta F3 (notificaciones push).
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-mailto:admin@example.com}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  caddy:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    ports:
+      # Solo en la interfaz de Docker: quien publica al mundo es el Caddy frontal.
+      - "172.17.0.1:8091:80"
+    depends_on:
+      - api
+
+volumes:
+  dbdata:

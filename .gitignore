@@ -1,0 +1,15 @@
+# Secretos: el .env vive solo en el servidor y en tu máquina.
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Frontend
+node_modules/
+dist/
+
+# Copias de seguridad de la base de datos
+backup_*.sql

@@ -1,0 +1,33 @@
+# Caddy de este stack: sirve el frontend estático y proxya /api a la API.
+#
+# Escucha en HTTP a secas (:80) a propósito: el HTTPS lo termina el Caddy
+# frontal de /opt/partes-de-obra, que es el dueño de los puertos 80/443 del
+# servidor y enruta teresoreria-178-104-99-197.sslip.io hasta aquí. Si aquí se
+# pusiera un hostname, Caddy intentaría sacar su propio certificado y redirigir
+# a https, y el proxy entraría en bucle.
+
+:80 {
+	encode zstd gzip
+
+	# La API conserva el prefijo /api (FastAPI enruta con ese prefijo).
+	@api path /api/*
+	handle @api {
+		reverse_proxy api:8000
+	}
+
+	# El service worker no debe cachearse: si se queda pegado, las
+	# actualizaciones de la app no llegan nunca al móvil.
+	@sw path /sw.js
+	handle @sw {
+		header Cache-Control "no-cache"
+		root * /srv
+		file_server
+	}
+
+	# Frontend estático (SPA): si no existe el fichero, cae a index.html.
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}
